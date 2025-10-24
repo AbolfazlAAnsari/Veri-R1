@@ -192,4 +192,13 @@ python infer.py
 
 You can modify the claim on line 7 to something you're interested in.
 
-## Citation
+## Citations
+
+```bibtex
+@article{he2025veri,
+  title={Veri-R1: Toward Precise and Faithful Claim Verification via Online Reinforcement Learning},
+  author={He, Qi and Qian, Cheng and Chen, Xiusi and He, Bingxiang and Ji, Heng and others},
+  journal={arXiv preprint arXiv:2510.01932},
+  year={2025}
+}
+```
