@@ -60,7 +60,7 @@ class Index_Builder:
     
     """
     def __init__(
-            self, 
+            self,
             retrieval_method,
             model_path,
             corpus_path,
@@ -72,9 +72,11 @@ class Index_Builder:
             faiss_type=None,
             embedding_path=None,
             save_embedding=False,
-            faiss_gpu=False
+            faiss_gpu=False,
+            shard_id=0,
+            num_shards=1
         ):
-        
+
         self.retrieval_method = retrieval_method.lower()
         self.model_path = model_path
         self.corpus_path = corpus_path
@@ -87,6 +89,8 @@ class Index_Builder:
         self.embedding_path = embedding_path
         self.save_embedding = save_embedding
         self.faiss_gpu = faiss_gpu
+        self.shard_id = shard_id
+        self.num_shards = num_shards
 
         self.gpu_num = torch.cuda.device_count()
         # prepare save dir
@@ -99,10 +103,19 @@ class Index_Builder:
 
         self.index_save_path = os.path.join(self.save_dir, f"{self.retrieval_method}_{self.faiss_type}.index")
 
-        self.embedding_save_path = os.path.join(self.save_dir, f"emb_{self.retrieval_method}.memmap")
-
         self.corpus = load_corpus(self.corpus_path)
-       
+
+        if num_shards > 1:
+            total = len(self.corpus)
+            shard_size = (total + num_shards - 1) // num_shards
+            start = shard_id * shard_size
+            end = min(start + shard_size, total)
+            self.corpus = self.corpus.select(range(start, end))
+            self.embedding_save_path = os.path.join(self.save_dir, f"emb_{self.retrieval_method}_shard{shard_id}.memmap")
+            print(f"Shard {shard_id}/{num_shards}: docs {start}–{end} ({len(self.corpus)} total)")
+        else:
+            self.embedding_save_path = os.path.join(self.save_dir, f"emb_{self.retrieval_method}.memmap")
+
         print("Finish loading...")
     @staticmethod
     def _check_dir(dir_path):
@@ -185,88 +198,69 @@ class Index_Builder:
         else:
             memmap[:] = all_embeddings
 
+    def _prepare_batch(self, start_idx):
+        end_idx = min(start_idx + self.batch_size, len(self.corpus))
+        titles = self.corpus[start_idx:end_idx]['title']
+        texts = self.corpus[start_idx:end_idx]['text']
+        docs = [f'"{t}"\n{x}' for t, x in zip(titles, texts)]
+        if self.retrieval_method == "e5":
+            docs = [f"passage: {d}" for d in docs]
+        return self.tokenizer(
+            docs,
+            padding=True,
+            truncation=True,
+            return_tensors='pt',
+            max_length=self.max_length,
+        )
+
     def encode_all(self):
-        if self.gpu_num > 1:
-            print("Use multi gpu!")
-            self.encoder = torch.nn.DataParallel(self.encoder)
-            self.batch_size = self.batch_size * self.gpu_num
+        import os
+        from concurrent.futures import ThreadPoolExecutor
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
         all_embeddings = []
+        indices = list(range(0, len(self.corpus), self.batch_size))
 
-        for start_idx in tqdm(range(0, len(self.corpus), self.batch_size), desc='Inference Embeddings:'):
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            prefetch = pool.submit(self._prepare_batch, indices[0])
 
-            batch_data_title = self.corpus[start_idx:start_idx+self.batch_size]['title']
-            batch_data_text = self.corpus[start_idx:start_idx+self.batch_size]['text']
-            batch_data = ['"' + title + '"\n' + text for title, text in zip(batch_data_title, batch_data_text)]
+            for i, start_idx in enumerate(tqdm(indices, desc='Inference Embeddings:')):
+                inputs = prefetch.result()
 
-            if self.retrieval_method == "e5":
-                batch_data = [f"passage: {doc}" for doc in batch_data]
+                # start tokenizing next batch while GPU processes this one
+                if i + 1 < len(indices):
+                    prefetch = pool.submit(self._prepare_batch, indices[i + 1])
 
-            inputs = self.tokenizer(
-                        batch_data,
-                        padding=True,
-                        truncation=True,
-                        return_tensors='pt',
-                        max_length=self.max_length,
-            ).to('cuda')
+                inputs = {k: v.cuda(non_blocking=True) for k, v in inputs.items()}
 
-            inputs = {k: v.cuda() for k, v in inputs.items()}
+                #TODO: support encoder-only T5 model
+                if "T5" in type(self.encoder).__name__:
+                    decoder_input_ids = torch.zeros(
+                        (inputs['input_ids'].shape[0], 1), dtype=torch.long
+                    ).to(inputs['input_ids'].device)
+                    output = self.encoder(
+                        **inputs, decoder_input_ids=decoder_input_ids, return_dict=True
+                    )
+                    embeddings = output.last_hidden_state[:, 0, :]
+                else:
+                    output = self.encoder(**inputs, return_dict=True)
+                    embeddings = pooling(output.pooler_output,
+                                        output.last_hidden_state,
+                                        inputs['attention_mask'],
+                                        self.pooling_method)
+                    if "dpr" not in self.retrieval_method:
+                        embeddings = torch.nn.functional.normalize(embeddings, dim=-1)
 
-            #TODO: support encoder-only T5 model
-            if "T5" in type(self.encoder).__name__:
-                # T5-based retrieval model
-                decoder_input_ids = torch.zeros(
-                    (inputs['input_ids'].shape[0], 1), dtype=torch.long
-                ).to(inputs['input_ids'].device)
-                output = self.encoder(
-                    **inputs, decoder_input_ids=decoder_input_ids, return_dict=True
-                )
-                embeddings = output.last_hidden_state[:, 0, :]
-
-            else:
-                output = self.encoder(**inputs, return_dict=True)
-                embeddings = pooling(output.pooler_output, 
-                                    output.last_hidden_state, 
-                                    inputs['attention_mask'],
-                                    self.pooling_method)
-                if  "dpr" not in self.retrieval_method:
-                    embeddings = torch.nn.functional.normalize(embeddings, dim=-1)
-
-            embeddings = cast(torch.Tensor, embeddings)
-            embeddings = embeddings.detach().cpu().numpy()
-            all_embeddings.append(embeddings)
+                embeddings = cast(torch.Tensor, embeddings)
+                embeddings = embeddings.detach().cpu().numpy()
+                all_embeddings.append(embeddings)
 
         all_embeddings = np.concatenate(all_embeddings, axis=0)
-        all_embeddings = all_embeddings.astype(np.float32)
+        return all_embeddings.astype(np.float32)
 
-        return all_embeddings
-
-    @torch.no_grad()
-    def build_dense_index(self):
-        """Obtain the representation of documents based on the embedding model(BERT-based) and 
-        construct a faiss index.
-        """
-        
-        if os.path.exists(self.index_save_path):
-            print("The index file already exists and will be overwritten.")
-        
-        self.encoder, self.tokenizer = load_model(model_path = self.model_path, 
-                                                  use_fp16 = self.use_fp16)
-        if self.embedding_path is not None:
-            hidden_size = self.encoder.config.hidden_size
-            corpus_size = len(self.corpus)
-            all_embeddings = self._load_embedding(self.embedding_path, corpus_size, hidden_size)
-        else:
-            all_embeddings = self.encode_all()
-            if self.save_embedding:
-                self._save_embedding(all_embeddings)
-            del self.corpus
-
-        # build index
-        print("Creating index")
+    def _build_faiss_index(self, all_embeddings):
         dim = all_embeddings.shape[-1]
         faiss_index = faiss.index_factory(dim, self.faiss_type, faiss.METRIC_INNER_PRODUCT)
-        
         if self.faiss_gpu:
             co = faiss.GpuMultipleClonerOptions()
             co.useFloat16 = True
@@ -280,7 +274,80 @@ class Index_Builder:
             if not faiss_index.is_trained:
                 faiss_index.train(all_embeddings)
             faiss_index.add(all_embeddings)
+        faiss.write_index(faiss_index, self.index_save_path)
 
+    @torch.no_grad()
+    def build_dense_index(self):
+        """Obtain the representation of documents based on the embedding model(BERT-based) and
+        construct a faiss index.
+        """
+
+        if os.path.exists(self.index_save_path):
+            print("The index file already exists and will be overwritten.")
+
+        self.encoder, self.tokenizer = load_model(model_path=self.model_path,
+                                                  use_fp16=self.use_fp16)
+        if self.embedding_path is not None:
+            hidden_size = self.encoder.config.hidden_size
+            corpus_size = len(self.corpus)
+            all_embeddings = self._load_embedding(self.embedding_path, corpus_size, hidden_size)
+        else:
+            all_embeddings = self.encode_all()
+            if self.save_embedding:
+                self._save_embedding(all_embeddings)
+            del self.corpus
+
+        if self.num_shards > 1:
+            print(f"Shard {self.shard_id} embedding saved. Skipping index build.")
+            return
+
+        print("Creating index")
+        self._build_faiss_index(all_embeddings)
+        print("Finish!")
+
+    def merge_and_build_index(self):
+        """Build faiss index from shard embeddings incrementally to avoid double disk usage."""
+        shard_paths = [
+            os.path.join(self.save_dir, f"emb_{self.retrieval_method}_shard{i}.memmap")
+            for i in range(self.num_shards)
+        ]
+        for p in shard_paths:
+            if not os.path.exists(p):
+                raise FileNotFoundError(f"Missing shard embedding: {p}")
+
+        # Get hidden_size from model config without loading weights
+        from transformers import AutoConfig
+        hidden_size = AutoConfig.from_pretrained(self.model_path, trust_remote_code=True).hidden_size
+
+        # Build faiss index incrementally: load one shard, add, delete shard file, repeat.
+        # This keeps peak disk usage at max(shard_total, index_size) rather than both at once.
+        faiss_index = faiss.index_factory(hidden_size, self.faiss_type, faiss.METRIC_INNER_PRODUCT)
+
+        # IVF-based indexes require training before any vectors can be added.
+        # Sample up to 500K vectors from the first shard — enough for centroid estimation.
+        if not faiss_index.is_trained:
+            print("Training index on sample vectors from first shard...")
+            first = np.memmap(shard_paths[0], mode="r", dtype=np.float32).reshape(-1, hidden_size)
+            n_train = min(500_000, len(first))
+            sample = np.array(first[:n_train])
+            del first
+            faiss_index.train(sample)
+            del sample
+            print("Training done.")
+
+        total_docs = 0
+        for p in tqdm(shard_paths, desc="Merging shards"):
+            arr = np.memmap(p, mode="r", dtype=np.float32).reshape(-1, hidden_size)
+            shard = np.array(arr)  # copy out of memmap so we can safely delete the file
+            del arr
+            faiss_index.add(shard)
+            total_docs += len(shard)
+            del shard
+            os.remove(p)  # free disk space before loading next shard
+            print(f"  Added {total_docs:,} docs so far, deleted {os.path.basename(p)}")
+
+        print(f"Total docs indexed: {total_docs:,}")
+        print(f"Writing index to {self.index_save_path} ...")
         faiss.write_index(faiss_index, self.index_save_path)
         print("Finish!")
 
@@ -311,7 +378,10 @@ def main():
     parser.add_argument('--embedding_path', default=None, type=str)
     parser.add_argument('--save_embedding', action='store_true', default=False)
     parser.add_argument('--faiss_gpu', default=False, action='store_true')
-    
+    parser.add_argument('--shard_id', type=int, default=0)
+    parser.add_argument('--num_shards', type=int, default=1)
+    parser.add_argument('--merge_shards', action='store_true', default=False)
+
     args = parser.parse_args()
 
     if args.pooling_method is None:
@@ -339,9 +409,15 @@ def main():
                         faiss_type = args.faiss_type,
                         embedding_path = args.embedding_path,
                         save_embedding = args.save_embedding,
-                        faiss_gpu = args.faiss_gpu
+                        faiss_gpu = args.faiss_gpu,
+                        shard_id = args.shard_id,
+                        num_shards = args.num_shards
                     )
-    index_builder.build_index()
+
+    if args.merge_shards:
+        index_builder.merge_and_build_index()
+    else:
+        index_builder.build_index()
 
 
 if __name__ == "__main__":
